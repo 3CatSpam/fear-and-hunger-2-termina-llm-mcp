@@ -16,28 +16,67 @@
 (function () {
     'use strict';
 
-    if (typeof require !== 'function') { return; }
+    // Under NW.js we host the HTTP server ourselves. Under a native WebKit host
+    // there is no Node; the host calls window.ClaudeBridge.call() instead.
+    var HAS_NODE = typeof require === 'function';
 
     var PORT = 7777;
     var HOST = '127.0.0.1';
     var ALLOW_EVAL = false; // cheating hatch; only flip for debugging the bridge itself
 
-    var http = require('http');
-    var fs = require('fs');
-    var os = require('os');
-    var path = require('path');
-    var crypto = require('crypto');
+    var http, TOKEN = '';
+    if (HAS_NODE) {
+        http = require('http');
+        var fs = require('fs');
+        var os = require('os');
+        var path = require('path');
+        var crypto = require('crypto');
+
+        var tokenPath = path.join(os.homedir(), '.fear-hunger-bridge-token');
+        try { TOKEN = fs.readFileSync(tokenPath, 'utf8').trim(); } catch (e) { /* first run */ }
+        if (!TOKEN) {
+            TOKEN = crypto.randomBytes(24).toString('hex');
+            fs.writeFileSync(tokenPath, TOKEN, { mode: 384 }); // 0600
+        }
+    }
 
     //-------------------------------------------------------------------------
-    // Auth token
+    // Native WebKit host: saves live in files managed by the host (localStorage is ~5MB,
+    // a single save here is >1MB), and some plugins drop globalId from save info.
     //-------------------------------------------------------------------------
 
-    var tokenPath = path.join(os.homedir(), '.fear-hunger-bridge-token');
-    var TOKEN = '';
-    try { TOKEN = fs.readFileSync(tokenPath, 'utf8').trim(); } catch (e) { /* first run */ }
-    if (!TOKEN) {
-        TOKEN = crypto.randomBytes(24).toString('hex');
-        fs.writeFileSync(tokenPath, TOKEN, { mode: 384 }); // 0600
+    if (!HAS_NODE) {
+        var storeReq = function (method, key, body) {
+            var x = new XMLHttpRequest();
+            x.open(method, '/store/' + encodeURIComponent(key), false);
+            x.setRequestHeader('X-Fung-Store', '1');
+            x.send(body || null);
+            return x;
+        };
+        StorageManager.saveToWebStorage = function (id, json) {
+            var x = storeReq('PUT', this.webStorageKey(id), LZString.compressToBase64(json));
+            if (x.status !== 200) { throw new Error('save failed: HTTP ' + x.status); }
+        };
+        StorageManager.loadFromWebStorage = function (id) {
+            var x = storeReq('GET', this.webStorageKey(id));
+            return x.status === 200 ? LZString.decompressFromBase64(x.responseText) : null;
+        };
+        StorageManager.webStorageExists = function (id) {
+            return storeReq('HEAD', this.webStorageKey(id)).status === 200;
+        };
+        StorageManager.removeWebStorage = function (id) {
+            storeReq('DELETE', this.webStorageKey(id));
+        };
+        var _makeSavefileInfo = DataManager.makeSavefileInfo;
+        DataManager.makeSavefileInfo = function () {
+            var info = _makeSavefileInfo.apply(this, arguments);
+            info.globalId = this._globalId;
+            return info;
+        };
+        DataManager.isThisGameFile = function (id) {
+            var gi = this.loadGlobalInfo();
+            return !!(gi && gi[id]) && StorageManager.exists(id);
+        };
     }
 
     //-------------------------------------------------------------------------
@@ -74,7 +113,6 @@
     var DIR_NAMES = { 2: 'down', 4: 'left', 6: 'right', 8: 'up' };
     var DIR_CODES = { down: 2, left: 4, right: 6, up: 8 };
     var DIR_KEYS = [2, 4, 6, 8];
-    var TRIGGERS = ['action', 'player-touch', 'event-touch', 'autorun', 'parallel'];
     var KEYS = ['ok', 'escape', 'up', 'down', 'left', 'right', 'shift', 'pageup', 'pagedown', 'tab', 'control'];
 
     function sceneName() {
@@ -113,159 +151,69 @@
     }
 
     //-------------------------------------------------------------------------
-    // Event inspection
+    // Event knowledge
     //-------------------------------------------------------------------------
-
-    function itemName(type, id) {
-        var db = type === 'weapon' ? $dataWeapons : type === 'armor' ? $dataArmors : $dataItems;
-        return db[id] ? db[id].name : type + '#' + id;
-    }
-
-    // Turn an event command list into human-readable lines.
-    function decode(list) {
-        var out = [];
-        var say = null;
-        function flush() { if (say !== null) { out.push('SAY: ' + say); say = null; } }
-        (list || []).forEach(function (c) {
-            var p = c.parameters;
-            if (c.code !== 401) { flush(); }
-            switch (c.code) {
-            case 0: break;
-            case 101: break;
-            case 401: say = (say === null ? '' : say + ' ') + stripCodes(p[0]); break;
-            case 102: out.push('CHOICES: ' + p[0].map(stripCodes).join(' | ')); break;
-            case 402: out.push('  when choice "' + stripCodes(p[1]) + '":'); break;
-            case 404: break;
-            case 108: case 408: out.push('COMMENT: ' + p[0]); break;
-            case 111: out.push('IF ' + decodeCondition(p)); break;
-            case 411: out.push('ELSE'); break;
-            case 412: out.push('END IF'); break;
-            case 112: out.push('LOOP'); break;
-            case 113: out.push('BREAK LOOP'); break;
-            case 115: out.push('EXIT EVENT'); break;
-            case 117: out.push('COMMON EVENT: ' + (($dataCommonEvents[p[0]] || {}).name || p[0])); break;
-            case 121: out.push('SWITCH ' + p[0] + (p[1] !== p[0] ? '..' + p[1] : '') + ' = ' + (p[2] === 0 ? 'ON' : 'OFF')); break;
-            case 122: out.push('VARIABLE ' + p[0] + (p[1] !== p[0] ? '..' + p[1] : '') + ' op' + p[2] + ' (type ' + p[3] + ', ' + p[4] + ')'); break;
-            case 123: out.push('SELF SWITCH ' + p[0] + ' = ' + (p[1] === 0 ? 'ON' : 'OFF')); break;
-            case 125: out.push('GOLD ' + (p[0] === 0 ? '+' : '-') + (p[1] === 0 ? p[2] : 'var' + p[2])); break;
-            case 126: out.push('ITEM ' + (p[1] === 0 ? '+' : '-') + (p[2] === 0 ? p[3] : 'var' + p[3]) + ' ' + itemName('item', p[0])); break;
-            case 127: out.push('WEAPON ' + (p[1] === 0 ? '+' : '-') + ' ' + itemName('weapon', p[0])); break;
-            case 128: out.push('ARMOR ' + (p[1] === 0 ? '+' : '-') + ' ' + itemName('armor', p[0])); break;
-            case 201:
-                out.push(p[0] === 0
-                    ? 'TRANSFER -> map ' + p[1] + ' (' + p[2] + ',' + p[3] + ')' + mapNameHint(p[1])
-                    : 'TRANSFER -> (variable-designated)');
-                break;
-            case 205: out.push('MOVE ROUTE'); break;
-            case 211: case 212: case 213: break;
-            case 221: case 222: case 223: case 224: case 225: break;
-            case 230: out.push('WAIT ' + p[0]); break;
-            case 241: out.push('BGM: ' + (p[0] && p[0].name)); break;
-            case 250: out.push('SE: ' + (p[0] && p[0].name)); break;
-            case 301: {
-                var tid = p[0] === 0 ? p[1] : null;
-                out.push('BATTLE: ' + (tid ? (($dataTroops[tid] || {}).name || 'troop ' + tid) : '(variable troop)') +
-                    (p[2] ? ' [can escape]' : '') + (p[3] ? ' [can lose]' : ''));
-                break;
-            }
-            case 601: out.push('  on win:'); break;
-            case 602: out.push('  on escape:'); break;
-            case 603: out.push('  on lose:'); break;
-            case 302: out.push('SHOP'); break;
-            case 311: out.push('CHANGE HP'); break;
-            case 313: out.push('CHANGE STATE ' + (p[3] === 0 ? '+' : '-') + ' ' + (($dataStates[p[4]] || {}).name || p[4])); break;
-            case 314: out.push('RECOVER ALL'); break;
-            case 355: say = null; out.push('SCRIPT: ' + p[0]); break;
-            case 655: out.push('  ...' + p[0]); break;
-            case 356: out.push('PLUGIN CMD: ' + p[0]); break;
-            case 132: case 133: case 134: case 135: case 136: case 137: case 138: break;
-            default: out.push('(cmd ' + c.code + ')'); break;
-            }
-        });
-        flush();
-        return out;
-    }
-
-    function mapNameHint(id) {
-        var info = window.$dataMapInfos && $dataMapInfos[id];
-        return info ? ' "' + info.name + '"' : '';
-    }
-
-    function decodeCondition(p) {
-        switch (p[0]) {
-        case 0: return 'switch ' + p[1] + ' is ' + (p[2] === 0 ? 'ON' : 'OFF');
-        case 1: return 'variable ' + p[1] + ' ' + ['==', '>=', '<=', '>', '<', '!='][p[4]] + ' ' + (p[2] === 0 ? p[3] : 'var' + p[3]);
-        case 2: return 'self-switch ' + p[1] + ' is ' + (p[2] === 0 ? 'ON' : 'OFF');
-        case 3: return 'timer';
-        case 4: return 'actor ' + p[1] + ' cond ' + p[2] + ' ' + p[3];
-        case 5: return 'enemy';
-        case 6: return 'character facing';
-        case 7: return 'gold ' + ['>=', '<=', '<'][p[2]] + ' ' + p[1];
-        case 8: return 'has item ' + itemName('item', p[1]);
-        case 9: return 'has weapon ' + itemName('weapon', p[1]);
-        case 10: return 'has armor ' + itemName('armor', p[1]);
-        case 11: return 'button ' + p[1];
-        case 12: return 'script: ' + p[1];
-        default: return 'cond ' + p[0];
-        }
-    }
-
-    function eventById(id) {
-        var ev = $gameMap.event(id);
-        if (!ev) { throw new Error('No event with id ' + id + ' on this map'); }
-        return ev;
-    }
 
     function isSolid(ev) { return ev.isNormalPriority() && !ev.isThrough(); }
 
-    function eventBrief(ev, px, py) {
-        var list = ev.list();
-        var lines = decode(list);
-        var say = lines.filter(function (l) { return l.indexOf('SAY: ') === 0; })[0];
-        var transfer = lines.filter(function (l) { return l.indexOf('TRANSFER') === 0; })[0];
-        var battle = lines.filter(function (l) { return l.indexOf('BATTLE') === 0; })[0];
-        var b = {
-            id: ev.eventId(),
-            name: ev.event().name,
-            x: ev.x,
-            y: ev.y,
-            dist: Math.abs(ev.x - px) + Math.abs(ev.y - py),
-            facing: DIR_NAMES[ev.direction()],
-            sprite: ev.characterName() || '',
-            trigger: TRIGGERS[ev._trigger],
-            solid: isSolid(ev)
-        };
-        if (ev.event().note) { b.note = ev.event().note; }
-        if (say) { b.says = say.slice(5, 80); }
-        if (transfer) { b.transfer = transfer.slice(12); }
-        if (battle) { b.battle = battle.slice(8); }
-        if (!ev.characterName() && !ev.isTile) { b.invisible = true; }
-        b.commands = list.length - 1;
+    // Fair-play event knowledge: only things a player could have seen on screen
+    // (a visible sprite, inside the viewport). Sightings are remembered per map
+    // (saved with the game) so something that walks out of view is still known
+    // to exist, at its last seen position, until we see that it is gone.
+    function isVisibleSprite(ev) {
+        return !ev._erased && ev._pageIndex >= 0 && !ev.isTransparent() &&
+            !!(ev.characterName() || ev.tileId() > 0);
+    }
+
+    function onScreen(ev) {
+        var dx = $gameMap.displayX(), dy = $gameMap.displayY();
+        return ev.x >= dx - 1 && ev.x <= dx + $gameMap.screenTileX() &&
+            ev.y >= dy - 1 && ev.y <= dy + $gameMap.screenTileY();
+    }
+
+    function seenStore() {
+        if (!$gameSystem._claudeSeen) { $gameSystem._claudeSeen = {}; }
+        var id = $gameMap.mapId();
+        return $gameSystem._claudeSeen[id] || ($gameSystem._claudeSeen[id] = {});
+    }
+
+    function updateSeen() {
+        var store = seenStore();
+        $gameMap.events().forEach(function (ev) {
+            if (!onScreen(ev)) { return; }
+            var id = ev.eventId();
+            if (isVisibleSprite(ev)) {
+                store[id] = { x: ev.x, y: ev.y, sprite: ev.characterName() || 'tile', solid: isSolid(ev) };
+            } else {
+                delete store[id];
+            }
+        });
+    }
+
+    function eventBrief(id, rec, px, py) {
+        var ev = $gameMap.event(id);
+        var live = !!ev && onScreen(ev) && isVisibleSprite(ev);
+        var b = { id: id, x: live ? ev.x : rec.x, y: live ? ev.y : rec.y, sprite: rec.sprite, solid: live ? isSolid(ev) : rec.solid };
+        b.dist = Math.abs(b.x - px) + Math.abs(b.y - py);
+        if (live) { b.facing = DIR_NAMES[ev.direction()]; } else { b.remembered = true; }
         return b;
     }
 
-    function isInteresting(ev) {
-        if (ev._erased || ev._pageIndex < 0) { return false; }
-        if (ev.characterName()) { return true; }
-        if (ev.list().length <= 1 || ev._trigger > 2) { return false; }
-        return ev.list().some(function (c) { return c.code === 401 || c.code === 201 || c.code === 301 || c.code === 126 || c.code === 127 || c.code === 128; });
+    function knownEvent(id) {
+        updateSeen();
+        var rec = seenStore()[id];
+        if (!rec) { throw new Error('You have not seen an event with id ' + id + ' on this map'); }
+        return rec;
     }
 
-    // Invisible touch trigger that does nothing obviously notable (fog reveals, sound cues, traps...).
-    function isHiddenTrigger(ev) {
-        return !ev._erased && ev._pageIndex >= 0 && ev._trigger >= 1 && ev._trigger <= 2 &&
-            ev.list().length > 1 && !isInteresting(ev);
-    }
-
-    function nearbyEvents(radius, all) {
+    function nearbyEvents(radius) {
+        updateSeen();
         var px = $gamePlayer.x, py = $gamePlayer.y;
+        var store = seenStore();
         var out = [];
-        $gameMap.events().forEach(function (ev) {
-            if (!all && !isInteresting(ev)) { return; }
-            if (all && (ev._erased || ev._pageIndex < 0)) { return; }
-            var d = Math.abs(ev.x - px) + Math.abs(ev.y - py);
-            if (radius != null && d > radius) { return; }
-            out.push(eventBrief(ev, px, py));
+        Object.keys(store).forEach(function (id) {
+            var b = eventBrief(+id, store[id], px, py);
+            if (radius == null || b.dist <= radius) { out.push(b); }
         });
         out.sort(function (a, b) { return a.dist - b.dist; });
         return out;
@@ -291,22 +239,18 @@
             x0 = Math.max(0, px - radius); x1 = Math.min($gameMap.width() - 1, px + radius);
             y0 = Math.max(0, py - radius); y1 = Math.min($gameMap.height() - 1, py + radius);
         }
-        var events = $gameMap.events().filter(function (ev) {
-            return isInteresting(ev) && ev.x >= x0 && ev.x <= x1 && ev.y >= y0 && ev.y <= y1;
-        }).sort(function (a, b) {
-            return (Math.abs(a.x - px) + Math.abs(a.y - py)) - (Math.abs(b.x - px) + Math.abs(b.y - py));
+        var events = nearbyEvents(null).filter(function (b) {
+            return b.x >= x0 && b.x <= x1 && b.y >= y0 && b.y <= y1;
         });
         var at = {};
-        var hidden = {};
-        $gameMap.events().forEach(function (ev) { if (isHiddenTrigger(ev)) { hidden[ev.x + ',' + ev.y] = true; } });
         var legend = [];
-        events.forEach(function (ev, i) {
+        events.forEach(function (b, i) {
             var g = GLYPHS.charAt(i) || '?';
-            var key = ev.x + ',' + ev.y;
+            var key = b.x + ',' + b.y;
             var stacked = !!at[key];
             if (!stacked) { at[key] = g; }
-            legend.push(g + ' #' + ev.eventId() + ' ' + ev.event().name + ' (' + ev.x + ',' + ev.y + ') ' +
-                TRIGGERS[ev._trigger] + (isSolid(ev) ? '' : ' walkable') + (stacked ? ' [stacked]' : ''));
+            legend.push(g + ' #' + b.id + ' ' + b.sprite + ' (' + b.x + ',' + b.y + ')' +
+                (b.solid ? '' : ' walkable') + (b.remembered ? ' [remembered, out of view]' : '') + (stacked ? ' [stacked]' : ''));
         });
         var rows = [];
         var header = '     ';
@@ -318,7 +262,6 @@
                 var ch;
                 if (x === px && y === py) { ch = '@'; }
                 else if (at[x + ',' + y]) { ch = at[x + ',' + y]; }
-                else if (hidden[x + ',' + y]) { ch = '~'; }
                 else { ch = tilePassable(x, y) ? '.' : '#'; }
                 line += ch;
             }
@@ -330,7 +273,7 @@
             view: { x0: x0, y0: y0, x1: x1, y1: y1 },
             ascii: rows.join('\n'),
             legend: legend,
-            key: '@ you, # blocked, . floor, ~ hidden touch-trigger (unknown effect), digits/letters are events (see legend); y down, x right'
+            key: '@ you, # blocked, . floor, digits/letters are events (see legend); y down, x right'
         };
     }
 
@@ -567,6 +510,11 @@
         _Game_Player_moveByInput.call(this);
     };
 
+    var seenTick = 0;
+    frameHooks.push(function () {
+        if (++seenTick % 6 === 0 && onMap() && $gameSystem && $gameMap.events) { updateSeen(); }
+    });
+
     frameHooks.push(function () {
         if (!walk) { return; }
         if (!onMap()) { finishWalk('interrupted', 'scene changed to ' + sceneName()); return; }
@@ -628,12 +576,23 @@
         return h;
     }
 
+    var WALK_REPLY_MS = 45000;
+
     function startWalk(steps, opts) {
-        return new Promise(function (resolve) {
+        var p = new Promise(function (resolve) {
             walk = { steps: steps.slice(), total: steps.length, stall: 0, idle: 0, evFrames: 0, dash: !!opts.dash, faceDir: opts.faceDir || 0, resolve: resolve };
             if (walk.dash) { keyDown('shift', true); }
             if (!steps.length) { finishWalk('arrived'); }
         });
+        // Reply before the MCP client times out; the walk keeps going.
+        var timer;
+        var deadline = new Promise(function (resolve) {
+            timer = setTimeout(function () {
+                resolve({ status: 'walking', x: $gamePlayer.x, y: $gamePlayer.y,
+                    note: 'still walking; call observe to check progress or stop_walk to cancel' });
+            }, WALK_REPLY_MS);
+        });
+        return Promise.race([p, deadline]).then(function (r) { clearTimeout(timer); return r; });
     }
 
     function checkCanStartWalk() {
@@ -664,10 +623,7 @@
         } else if (onMap() && $gamePlayer) {
             out.map = mapInfo();
             out.player = playerInfo();
-            out.events = nearbyEvents(radius, false);
-            out.hidden_triggers_nearby = $gameMap.events().filter(function (ev) {
-                return isHiddenTrigger(ev) && Math.abs(ev.x - $gamePlayer.x) + Math.abs(ev.y - $gamePlayer.y) <= radius;
-            }).length;
+            out.events = nearbyEvents(radius);
             out.walking = !!walk;
         }
         if (window.$gameParty && $gameParty.members) {
@@ -684,22 +640,33 @@
         return out;
     };
 
+    // Measures how fast the game loop actually runs (updates per second over ~2s).
+    H.perf = function () {
+        var n = 0;
+        var hook = function () { n++; };
+        frameHooks.push(hook);
+        var t0 = Date.now();
+        return new Promise(function (resolve) {
+            setTimeout(function () {
+                frameHooks.splice(frameHooks.indexOf(hook), 1);
+                var secs = (Date.now() - t0) / 1000;
+                resolve({ fps: Math.round(n / secs * 10) / 10, seconds: secs, scene: sceneName(),
+                          focus: document.hasFocus(), visibility: document.visibilityState });
+            }, 2000);
+        });
+    };
+
     H.look = function (p) { return lookAround(p.radius != null ? p.radius : 8, !!p.whole); };
 
     H.events = function (p) {
         needMap();
-        return nearbyEvents(p.radius != null ? p.radius : null, !!p.all);
+        return nearbyEvents(p.radius != null ? p.radius : null);
     };
 
     H.peek_event = function (p) {
         needMap();
-        var ev = eventById(p.id);
-        var brief = eventBrief(ev, $gamePlayer.x, $gamePlayer.y);
-        brief.commands_decoded = decode(ev.list());
-        brief.page_index = ev._pageIndex;
-        brief.pages_total = ev.event().pages.length;
-        brief.note = ev.event().note || undefined;
-        return brief;
+        var rec = knownEvent(p.id);
+        return eventBrief(p.id, rec, $gamePlayer.x, $gamePlayer.y);
     };
 
     H.party = function (p) { return { gold: $gameParty.gold(), members: partyInfo(!!p.skills) }; };
@@ -712,8 +679,18 @@
     };
     H.ui = function () { return uiInfo(); };
 
-    H.ui_choose = function (p) {
+    // Wait (up to ~1.5s) for a selectable window to finish opening and become active.
+    function whenWindowActive(tries) {
         var w = activeWindow();
+        if (w || tries <= 0) { return Promise.resolve(w); }
+        return frames(3).then(function () { return whenWindowActive(tries - 3); });
+    }
+
+    H.ui_choose = function (p) {
+        return whenWindowActive(90).then(function (w) { return chooseIn(w, p); });
+    };
+
+    function chooseIn(w, p) {
         if (!w) { throw new Error('No active menu/choice window. Current UI: ' + JSON.stringify(uiInfo())); }
         var i = p.index;
         if (i < 0 || i >= w.maxItems()) { throw new Error('Index out of range 0..' + (w.maxItems() - 1)); }
@@ -722,7 +699,7 @@
         if (p.confirm === false) { return frames(2).then(uiInfo); }
         if (!enabled) { return uiInfo(); }
         return tap('ok').then(function () { return frames(4); }).then(uiInfo);
-    };
+    }
 
     H.ui_cancel = function () {
         return tap('escape').then(function () { return frames(4); }).then(uiInfo);
@@ -761,7 +738,7 @@
         function loop() {
             var m = record();
             if (m && (m.choices || m.numberInput || m.itemChoice)) {
-                return Promise.resolve({ stopped: 'choice', text: seen, ui: uiInfo() });
+                return whenWindowActive(90).then(function () { return { stopped: 'choice', text: seen, ui: uiInfo() }; });
             }
             if (!m) {
                 if (++quiet > 8 || !$gameMap || !$gameMap.isEventRunning()) {
@@ -773,7 +750,6 @@
             if (++iter > max) { return Promise.resolve({ stopped: 'max', text: seen, ui: uiInfo() }); }
             return frames(6).then(function () { record(); return tap('ok'); }).then(loop);
         }
-        if (p.until_choice_only) { max = 500; }
         return loop();
     };
 
@@ -781,9 +757,11 @@
         return Promise.resolve(checkCanStartWalk()).then(function () {
             var tx = p.x, ty = p.y, adjacent = !!p.adjacent;
             if (p.event_id != null) {
-                var ev = eventById(p.event_id);
-                tx = ev.x; ty = ev.y;
-                if (p.adjacent == null) { adjacent = isSolid(ev) || ev._trigger === 0; }
+                var rec = knownEvent(p.event_id);
+                var ev = $gameMap.event(p.event_id);
+                var seenNow = ev && onScreen(ev) && isVisibleSprite(ev);
+                tx = seenNow ? ev.x : rec.x; ty = seenNow ? ev.y : rec.y;
+                if (p.adjacent == null) { adjacent = rec.solid; }
             }
             if (tx == null || ty == null) { throw new Error('Give x and y, or event_id'); }
             var px = $gamePlayer.x, py = $gamePlayer.y;
@@ -886,37 +864,63 @@
     // HTTP server
     //-------------------------------------------------------------------------
 
-    var server = http.createServer(function (req, res) {
-        function send(code, obj) {
-            var body = JSON.stringify(obj);
-            res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
-            res.end(body);
+    // Every handler runs one at a time so overlapping calls can't fight over
+    // the same input/menu state. stop_walk and ping bypass the queue so a
+    // long walk can still be interrupted.
+    var queue = Promise.resolve();
+    var UNQUEUED = { stop_walk: 1, ping: 1 };
+    function run(method, fn, params) {
+        function exec() {
+            try { return Promise.resolve(fn(params)); } catch (e) { return Promise.reject(e); }
         }
-        if (req.method !== 'POST' || req.url !== '/rpc') { return send(404, { error: 'not found' }); }
-        if (req.headers.origin || req.headers['x-bridge-token'] !== TOKEN) { return send(403, { error: 'forbidden' }); }
-        var chunks = [];
-        var size = 0;
-        req.on('data', function (c) {
-            size += c.length;
-            if (size > 1e6) { req.destroy(); return; }
-            chunks.push(c);
-        });
-        req.on('end', function () {
-            var msg;
-            try { msg = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return send(400, { error: 'bad json' }); }
-            var fn = H[msg.method];
-            if (!fn) { return send(200, { error: 'unknown method ' + msg.method }); }
-            var started;
-            try { started = Promise.resolve(fn(msg.params || {})); } catch (e) { started = Promise.reject(e); }
-            started.then(
-                function (r) { send(200, { result: r }); },
-                function (e) { send(200, { error: String(e && e.message || e) }); }
-            );
-        });
-    });
+        if (UNQUEUED[method]) { return exec(); }
+        var result = queue.then(exec);
+        queue = result.then(function () {}, function () {});
+        return result;
+    }
 
-    server.on('error', function (e) { console.error('[ClaudeBridge] server error', e && e.message); });
-    server.listen(PORT, HOST, function () { console.log('[ClaudeBridge] listening on ' + HOST + ':' + PORT); });
+    var server = null;
+    if (HAS_NODE) {
+        var server = http.createServer(function (req, res) {
+            function send(code, obj) {
+                var body = JSON.stringify(obj);
+                res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+                res.end(body);
+            }
+            if (req.method !== 'POST' || req.url !== '/rpc') { return send(404, { error: 'not found' }); }
+            if (req.headers.origin || req.headers['x-bridge-token'] !== TOKEN) { return send(403, { error: 'forbidden' }); }
+            var chunks = [];
+            var size = 0;
+            req.on('data', function (c) {
+                size += c.length;
+                if (size > 1e6) { req.destroy(); return; }
+                chunks.push(c);
+            });
+            req.on('end', function () {
+                var msg;
+                try { msg = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return send(400, { error: 'bad json' }); }
+                var fn = H[msg.method];
+                if (!fn) { return send(200, { error: 'unknown method ' + msg.method }); }
+                var started = run(msg.method, fn, msg.params || {});
+                started.then(
+                    function (r) { send(200, { result: r }); },
+                    function (e) { send(200, { error: String(e && e.message || e) }); }
+                );
+            });
+        });
 
-    window.ClaudeBridge = { handlers: H, server: server };
+        server.on('error', function (e) { console.error('[ClaudeBridge] server error', e && e.message); });
+        server.listen(PORT, HOST, function () { console.log('[ClaudeBridge] listening on ' + HOST + ':' + PORT); });
+
+    }
+
+    window.ClaudeBridge = {
+        handlers: H,
+        server: server,
+        call: function (method, params) {
+            var fn = H[method];
+            if (!fn) { return Promise.reject(new Error('unknown method ' + method)); }
+            return run(method, fn, params || {});
+        }
+    };
 })();

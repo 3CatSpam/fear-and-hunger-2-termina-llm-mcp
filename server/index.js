@@ -56,14 +56,14 @@ const dir = z.enum(['up', 'down', 'left', 'right']);
 
 bridgeTool(
   'observe',
-  'One-call situational awareness: scene, map, player position/facing, notable nearby events (with what they say/transfer/battle), party HP/states, any open dialogue or menu, and battle state. Call this first and after every action.',
+  'One-call situational awareness: scene, map, player position/facing, visible or remembered nearby events (sprite, position), party HP/states, any open dialogue or menu, and battle state. Call this first and after every action.',
   { radius: z.number().int().min(1).max(40).optional().describe('Event radius in tiles (default 7)') },
 );
 
 server.registerTool(
   'look',
   {
-    description: 'ASCII map around the player with a legend of events. # blocked, . floor, ~ hidden touch trigger (unknown effect), @ you, digits/letters are events (see legend). Use whole=true for the full map.',
+    description: 'ASCII map around the player with a legend of events you have seen. # blocked, . floor, @ you, digits/letters are events (see legend). Use whole=true for the full map.',
     inputSchema: {
       radius: z.number().int().min(1).max(40).optional().describe('Tiles in each direction (default 8)'),
       whole: z.boolean().optional().describe('Show the entire map'),
@@ -88,22 +88,21 @@ server.registerTool(
 
 bridgeTool(
   'events',
-  'List events on the current map. Default: notable ones on the whole map, sorted by distance. all=true includes silent/invisible ones.',
+  'List events you have seen on this map (on screen now, or remembered from earlier at their last known position), sorted by distance.',
   {
     radius: z.number().int().min(1).optional().describe('Only events within this many tiles'),
-    all: z.boolean().optional(),
   },
 );
 
 bridgeTool(
   'peek_event',
-  "Decode what an event WILL do (dialogue lines, transfers, battles, item gains, switches, scripts) without triggering it. Use before touching unknown doors, chests, NPCs and tiles - great for avoiding traps and knowing where a door leads.",
+  'Details of an event you have already seen (visible sprite, position, solidity, whether it is out of view). Does not reveal what it does; interact to find out.',
   { id: z.number().int().describe('Event id from observe/look/events') },
 );
 
 bridgeTool(
   'walk_to',
-  'Pathfind and walk to a tile or next to an event, using the game\'s own passability. Avoids touch-trigger events that transfer/battle/hurt unless allow_hazards. Stops if dialogue or an event starts. With event_id it stands adjacent and faces the event (ready for interact).',
+  'Pathfind and walk to a tile or next to an event, using the game\'s own passability. Stops if dialogue or an event starts. With event_id it stands adjacent and faces the event (ready for interact).',
   {
     x: z.number().int().optional(),
     y: z.number().int().optional(),

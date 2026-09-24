@@ -24,4 +24,22 @@ Notes: the game window must stay visible (not minimised) or it stops rendering f
 Re-run `./install.sh install` after any game update that overwrites plugins.js.
 
 ## Fair-play rules for Claude
-No teleporting, wall-walking, forcing dialogue options/skills/items the game doesn't offer, targeting hidden enemy parts, or editing game state. Use only the game's own menus and movement. `peek_event` is for scouting, so use it sparingly and treat it like knowledge the player could reasonably have.
+No teleporting, wall-walking, forcing dialogue options/skills/items the game doesn't offer, targeting hidden enemy parts, or editing game state. Use only the game's own menus and movement. Event info (`observe`, `look`, `events`, `peek_event`) only covers what a player has seen: visible sprites, remembered at their last known position once out of view. It never decodes what an event does.
+
+## Native WebKit / arm64 build (experimental)
+
+`wk-host/` builds a separate app that runs the game in Apple's WebKit (`WKWebView`) instead of the old Intel-only
+NW.js/Chromium 65 runtime. The original game is left untouched; game data is cloned (APFS copy-on-write, ~no extra disk).
+
+```
+./wk-host/build.sh      # -> build/Fear and Hunger 2 Termina (WebKit).app
+./wk-host/run.sh        # launch (double-clicking the .app also works if LaunchServices allows it)
+```
+
+The Swift host serves the game files on 127.0.0.1:7777, forwards `/rpc` into the page (same MCP server, same token),
+and stores saves as files in `~/Library/Application Support/FungerWK/store` (localStorage is too small for this game's saves;
+saves are NOT shared with the NW.js version).
+
+Known limits: `open` may refuse ad-hoc-signed local apps (-10825) - use `run.sh`; WebKit runs at 30fps while macOS
+Low Power Mode is on; only one of the two versions can run at a time (both use port 7777).
+`DEBUG_EVAL=1 ./wk-host/build.sh` enables the eval hatch for testing only.
