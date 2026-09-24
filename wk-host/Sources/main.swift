@@ -9,6 +9,7 @@ import Network
 import WebKit
 
 let port: UInt16 = 7777
+let bridgeEnabled = ProcessInfo.processInfo.environment["FUNGER_BRIDGE"] == "1"
 
 func log(_ s: String) { fputs("[FungerWK] \(s)\n", stderr) }
 
@@ -108,6 +109,9 @@ final class GameServer {
         let path = req.target.split(separator: "?", maxSplits: 1).first.map(String.init) ?? "/"
 
         if path == "/rpc" {
+            guard bridgeEnabled else {
+                return sendBody(conn, status: 404, type: "text/plain", body: Data("not found".utf8), next: next)
+            }
             guard req.method == "POST", req.headers["origin"] == nil, req.headers["x-bridge-token"] == token else {
                 return sendBody(conn, status: 403, type: "application/json", body: Data("{\"error\":\"forbidden\"}".utf8), next: next)
             }
@@ -195,6 +199,20 @@ final class GameServer {
         var rel = path.removingPercentEncoding ?? path
         if rel == "/" { rel = "/index.html" }
         if rel.contains("..") { return sendBody(conn, status: 403, type: "text/plain", body: Data("forbidden".utf8), next: next) }
+
+        // The game folder is never modified: our plugin is injected into the served plugin list instead.
+        if rel == "/js/plugins.js", var text = try? String(contentsOfFile: root + rel, encoding: .utf8), !text.contains("\"ClaudeBridge\"") {
+            if let close = text.range(of: "]", options: .backwards) {
+                var head = String(text[text.startIndex..<close.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !head.hasSuffix(",") { head += "," }
+                text = head + "\n{\"name\":\"ClaudeBridge\",\"status\":true,\"description\":\"WebKit shims\",\"parameters\":{}}\n" + String(text[close.lowerBound...])
+            }
+            return sendBody(conn, status: 200, type: "text/javascript; charset=utf-8", body: Data(text.utf8), next: next)
+        }
+        if rel == "/js/plugins/ClaudeBridge.js", let res = Bundle.main.path(forResource: "ClaudeBridge", ofType: "js"),
+           let data = FileManager.default.contents(atPath: res) {
+            return sendBody(conn, status: 200, type: "text/javascript; charset=utf-8", body: data, next: next)
+        }
         let full = root + rel
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: full, isDirectory: &isDir), !isDir.boolValue,
@@ -257,6 +275,52 @@ final class GameServer {
     }
 }
 
+// MARK: - Locating the player's own copy of the game
+
+func validRoot(_ path: String) -> String? {
+    let fm = FileManager.default
+    func ok(_ p: String) -> Bool { fm.fileExists(atPath: p + "/index.html") && fm.fileExists(atPath: p + "/js/rpg_core.js") }
+    for sub in ["", "/Contents/Resources/app.nw", "/www", "/Contents/Resources/app.nw/www"] where ok(path + sub) { return path + sub }
+    return nil
+}
+
+func findGameRoot() -> String? {
+    let env = ProcessInfo.processInfo.environment
+    if let p = env["FUNGER_ROOT"], let r = validRoot(p) { return r }
+    if let p = UserDefaults.standard.string(forKey: "gameRoot"), let r = validRoot(p) { return r }
+    let home = NSHomeDirectory()
+    var candidates = [
+        "/Applications/Fear and Hunger 2 Termina.app", home + "/Applications/Fear and Hunger 2 Termina.app",
+    ]
+    for base in [home + "/Library/Application Support/Steam/steamapps/common", "/Applications", home + "/Applications"] {
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: base)) ?? [] {
+            let l = name.lowercased()
+            if l.contains("termina") || (l.contains("fear") && l.contains("hunger")) { candidates.append(base + "/" + name) }
+        }
+    }
+    for c in candidates { if let r = validRoot(c) { return r } }
+    return nil
+}
+
+func askForGame() -> String? {
+    let panel = NSOpenPanel()
+    panel.title = "Select your copy of Fear & Hunger 2: Termina"
+    panel.message = "Choose the game (.app, or its folder). This launcher does not include the game and never modifies it."
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    while panel.runModal() == .OK, let url = panel.url {
+        if let r = validRoot(url.path) {
+            UserDefaults.standard.set(url.path, forKey: "gameRoot")
+            return r
+        }
+        let a = NSAlert(); a.messageText = "That doesn't look like the game"
+        a.informativeText = "Expected an RPG Maker MV game (a folder with index.html and js/rpg_core.js)."
+        a.runModal()
+    }
+    return nil
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -267,9 +331,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         log("didFinishLaunching")
-        let root = ProcessInfo.processInfo.environment["FUNGER_ROOT"]
-            ?? Bundle.main.resourcePath.map { $0 + "/app.nw" } ?? "."
-        server = GameServer(root: root, token: loadToken())
+        guard let root = findGameRoot() ?? askForGame() else { NSApp.terminate(nil); return }
+        server = GameServer(root: root, token: bridgeEnabled ? loadToken() : "")
 
         let cfg = WKWebViewConfiguration()
         cfg.mediaTypesRequiringUserActionForPlayback = []
@@ -283,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled, .latencyCritical],
                                                          reason: "Running the game")
         webView = WKWebView(frame: .zero, configuration: cfg)
-        webView.isInspectable = true
+        if #available(macOS 13.3, *) { webView.isInspectable = bridgeEnabled }
         // Private WebKit knob: keep the page "visible" even when another window covers it, so the game
         // (and the MCP bridge) keeps running while you work in other apps.
         let occl = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
@@ -308,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 816, height: 624),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
-        window.title = "Fear & Hunger 2: TERMINA (WebKit)"
+        window.title = "Fear & Hunger 2: TERMINA"
         window.contentView = webView
         window.delegate = self
         window.collectionBehavior = [.fullScreenPrimary]
@@ -322,7 +385,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         webView.load(URLRequest(url: URL(string: "http://127.0.0.1:\(port)/index.html")!))
     }
 
-    func forward(_ body: Data, _ done: @escaping (Data, Int) -> Void) {
+    func forward(_ body: Data, _ doneRaw: @escaping (Data, Int) -> Void) {
+        var finished = false
+        let done: (Data, Int) -> Void = { d, st in
+            if finished { return }
+            finished = true
+            doneRaw(d, st)
+        }
+        // never leave the MCP client hanging if the page wedges
+        DispatchQueue.main.asyncAfter(deadline: .now() + 100) {
+            if finished { return }
+            let obj = try? JSONSerialization.data(withJSONObject: ["error": "timed out waiting for the game (page unresponsive?)"])
+            done(obj ?? Data(), 200)
+        }
         func fail(_ msg: String, _ status: Int = 200) {
             let obj = try? JSONSerialization.data(withJSONObject: ["error": msg])
             done(obj ?? Data("{\"error\":\"?\"}".utf8), status)
@@ -349,6 +424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let main = NSMenu()
         let appItem = NSMenuItem(); main.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
+        let choose = appMenu.addItem(withTitle: "Choose Game Location…", action: #selector(chooseGame), keyEquivalent: "")
+        choose.target = self
         appMenu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let viewItem = NSMenuItem(); main.addItem(viewItem)
         let viewMenu = NSMenu(title: "View"); viewItem.submenu = viewMenu
@@ -357,6 +434,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let reload = viewMenu.addItem(withTitle: "Reload", action: #selector(reloadGame), keyEquivalent: "r")
         reload.target = self
         NSApp.mainMenu = main
+    }
+
+    @objc func chooseGame() {
+        UserDefaults.standard.removeObject(forKey: "gameRoot")
+        let a = NSAlert(); a.messageText = "Game location cleared"
+        a.informativeText = "Quit and reopen the launcher to pick the game folder again."
+        a.runModal()
     }
 
     @objc func reloadGame() { webView.reloadFromOrigin() }

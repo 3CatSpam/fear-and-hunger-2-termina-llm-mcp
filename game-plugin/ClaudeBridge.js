@@ -389,6 +389,10 @@
                 var info = DataManager.loadSavefileInfo(i + 1);
                 return info ? 'slot ' + (i + 1) + ': ' + (info.title || '') + ' ' + (info.playtime || '') : '';
             }
+            if (w._actor && typeof w.slotName === 'function' && typeof w._actor.equips === 'function') {
+                var eq = w._actor.equips()[i];
+                return w.slotName(i) + ': ' + (eq ? eq.name : '(empty)');
+            }
             if (typeof w.table === 'function' && w._page != null) { return w.table()[w._page][i] || ''; }
             if (w._enemies && w._enemies[i]) { return w._enemies[i].name(); }
             if (w._data && w._data[i]) { return w._data[i].name; }
