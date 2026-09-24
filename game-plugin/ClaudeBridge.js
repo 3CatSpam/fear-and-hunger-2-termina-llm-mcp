@@ -640,19 +640,34 @@
         return out;
     };
 
-    // Measures how fast the game loop actually runs (updates per second over ~2s).
-    H.perf = function () {
-        var n = 0;
-        var hook = function () { n++; };
+    // Measures the game loop over N seconds (default 2): fps and frame-time distribution (lag spikes).
+    H.perf = function (p) {
+        var seconds = Math.max(1, Math.min(120, p.seconds || 2));
+        var deltas = [];
+        var last = null;
+        var hook = function () {
+            var t = performance.now();
+            if (last !== null) { deltas.push(t - last); }
+            last = t;
+        };
         frameHooks.push(hook);
         var t0 = Date.now();
         return new Promise(function (resolve) {
             setTimeout(function () {
                 frameHooks.splice(frameHooks.indexOf(hook), 1);
                 var secs = (Date.now() - t0) / 1000;
-                resolve({ fps: Math.round(n / secs * 10) / 10, seconds: secs, scene: sceneName(),
-                          focus: document.hasFocus(), visibility: document.visibilityState });
-            }, 2000);
+                var sorted = deltas.slice().sort(function (a, b) { return a - b; });
+                var pct = function (q) { return sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] * 10) / 10 : null; };
+                var over = function (ms) { return deltas.filter(function (d) { return d > ms; }).length; };
+                resolve({
+                    fps: Math.round(deltas.length / secs * 10) / 10,
+                    seconds: secs,
+                    frames: deltas.length,
+                    frame_ms: { p50: pct(0.5), p95: pct(0.95), p99: pct(0.99), max: sorted.length ? Math.round(sorted[sorted.length - 1]) : null },
+                    spikes: { over_25ms: over(25), over_50ms: over(50), over_100ms: over(100) },
+                    scene: sceneName(), focus: document.hasFocus(), visibility: document.visibilityState
+                });
+            }, seconds * 1000);
         });
     };
 

@@ -42,4 +42,5 @@ saves are NOT shared with the NW.js version).
 
 Known limits: `open` may refuse ad-hoc-signed local apps (-10825) - use `run.sh`; WebKit runs at 30fps while macOS
 Low Power Mode is on; only one of the two versions can run at a time (both use port 7777).
+`perf` (also a bridge method) reports fps, frame-time percentiles and lag-spike counts.
 `DEBUG_EVAL=1 ./wk-host/build.sh` enables the eval hatch for testing only.
