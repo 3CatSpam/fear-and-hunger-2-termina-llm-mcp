@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fear-hunger": {
+      "command": "node",
+      "args": ["server/index.js"]
+    }
+  }
+}
